@@ -100,7 +100,7 @@ cargo add turbovec
 ```rust
 use turbovec::TurboQuantIndex;
 
-let mut index = TurboQuantIndex::new(1536, 4);
+let mut index = TurboQuantIndex::new(1536, 4).unwrap();
 index.add(&vectors);
 let results = index.search(&queries, 10);
 index.write("index.tv").unwrap();
@@ -112,8 +112,8 @@ For stable external ids that survive deletes:
 ```rust
 use turbovec::IdMapIndex;
 
-let mut index = IdMapIndex::new(1536, 4);
-index.add_with_ids(&vectors, &[1001, 1002, 1003]);
+let mut index = IdMapIndex::new(1536, 4).unwrap();
+index.add_with_ids(&vectors, &[1001, 1002, 1003]).unwrap();
 let (scores, ids) = index.search(&queries, 10);
 index.remove(1002);
 index.write("index.tvim").unwrap();

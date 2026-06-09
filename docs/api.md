@@ -40,9 +40,9 @@ Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` ret
 
 | Method | Notes |
 |---|---|
-| `TurboQuantIndex(dim=None, bit_width=4)` | `bit_width ∈ {2, 4}`. `dim` is optional; when omitted it is inferred from the first `add` call. |
-| `add(vectors)` | `vectors` is a contiguous float32 array of shape `(n, dim)`. On a lazy index the first call locks `dim`; subsequent calls must match. Raises `ValueError` on dim mismatch. |
-| `search(queries, k, *, mask=None)` | Returns `(scores, indices)`, both shape `(nq, effective_k)`. Indices are `int64` slot positions. `mask` is an optional `bool` array of length `len(idx)`; when given, only slots with `mask[i] == True` contribute. `effective_k = min(k, mask.sum())`. |
+| `TurboQuantIndex(dim=None, bit_width=4)` | `bit_width ∈ {2, 3, 4}`. `dim` is optional; when omitted it is inferred from the first `add` call. |
+| `add(vectors)` | `vectors` is a contiguous float32 array of shape `(n, dim)`. On a lazy index the first call locks `dim`; subsequent calls must match. Raises `ValueError` on dim mismatch, non-contiguous input, or invalid coordinates. |
+| `search(queries, k, *, mask=None)` | Returns `(scores, indices)`, both shape `(nq, effective_k)`. Indices are `int64` slot positions. `mask` is an optional `bool` array of length `len(idx)`; when given, only slots with `mask[i] == True` contribute. `effective_k = min(k, len(idx), mask.sum())`. |
 | `swap_remove(idx)` | O(1). Moves the last vector into `idx`; returns the previous position of that moved vector (so external refs can be updated if needed). |
 | `prepare()` | Optional. Eagerly builds the rotation matrix, Lloyd-Max centroids and SIMD-blocked layout so the first `search` call doesn't pay the one-time cost. No-op on a lazy index that hasn't seen its first add. |
 | `write(path)` / `load(path)` | `.tv` format. |
@@ -87,10 +87,10 @@ idx.add_with_ids(vectors, ids)           # locks dim to vectors.shape[1]
 
 | Method | Notes |
 |---|---|
-| `IdMapIndex(dim=None, bit_width=4)` | `dim` is optional; when omitted it is inferred from the first `add_with_ids` call. |
-| `add_with_ids(vectors, ids)` | `ids` is a `uint64` array with length `vectors.shape[0]`. On a lazy index the first call locks `dim`. Raises `ValueError` on dim mismatch, duplicate ids, or `len(ids) != vectors.shape[0]`. |
+| `IdMapIndex(dim=None, bit_width=4)` | `bit_width ∈ {2, 3, 4}`. `dim` is optional; when omitted it is inferred from the first `add_with_ids` call. |
+| `add_with_ids(vectors, ids)` | `ids` is a `uint64` array with length `vectors.shape[0]`. On a lazy index the first call locks `dim`. Raises `ValueError` on dim mismatch, duplicate ids, invalid coordinates, or `len(ids) != vectors.shape[0]`. |
 | `remove(id) -> bool` | `True` if the id was present and removed, `False` otherwise. O(1). |
-| `search(queries, k, *, allowlist=None)` | Returns `(scores, ids)` — `ids` are `uint64` external ids. `allowlist` is an optional `uint64` array of ids; when given, results are restricted to those ids and `effective_k = min(k, len(allowlist))`. Raises `ValueError` on empty allowlist and `KeyError` on unknown ids. |
+| `search(queries, k, *, allowlist=None)` | Returns `(scores, ids)` — `ids` are `uint64` external ids. `allowlist` is an optional `uint64` array of ids; when given, results are restricted to those ids and `effective_k = min(k, len(idx), number of unique allowed ids)`. Raises `ValueError` on empty allowlist and `KeyError` on unknown ids. |
 | `contains(id)` / `id in idx` | Membership. |
 | `write(path)` / `load(path)` | `.tvim` format. |
 | `len(idx)` / `idx.dim` / `idx.bit_width` / `prepare()` | Same as `TurboQuantIndex`. |
@@ -112,7 +112,7 @@ Both index types support restricting the returned top-`k` to a caller-supplied s
 # IdMapIndex — allowlist of external ids (typical use)
 allowed = np.array([1003, 1010, 1042], dtype=np.uint64)
 scores, ids = idx.search(queries, k=10, allowlist=allowed)
-# scores.shape == (nq, min(k, len(allowed))) == (nq, 3)
+# scores.shape == (nq, min(k, number of unique allowed ids)) == (nq, 3)
 
 # TurboQuantIndex — bool mask over slots
 mask = np.ones(len(idx), dtype=bool)
@@ -136,7 +136,10 @@ Common use cases:
 
 ```
 ┌──────────────────────────────────────┐
-│ 9-byte header                         │
+│ magic   "TVPI"  (4 bytes)             │
+│ version u8 = 3                        │
+├──────────────────────────────────────┤
+│ 9-byte core header                    │
 │   bit_width  (u8)                     │
 │   dim        (u32 LE)                 │
 │   n_vectors  (u32 LE)                 │
@@ -144,18 +147,28 @@ Common use cases:
 │ packed codes                          │
 │   (dim / 8) * bit_width * n_vectors   │
 ├──────────────────────────────────────┤
-│ norms  (n_vectors × f32 LE)           │
+│ per-vector scales                     │
+│   n_vectors × f32 LE                  │
+├──────────────────────────────────────┤
+│ TQ+ calibration trailer               │
+│   n_calib       (u32 LE)              │
+│   tqplus_shift  (n_calib × f32 LE)    │
+│   tqplus_scale  (n_calib × f32 LE)    │
 └──────────────────────────────────────┘
 ```
+
+`n_calib = 0` means identity calibration. Otherwise `n_calib` must equal `dim`.
 
 ### `.tvim` — `IdMapIndex`
 
 ```
 ┌──────────────────────────────────────┐
 │ magic   "TVIM"  (4 bytes)             │
-│ version  u8   = 1                     │
+│ version u8 = 3                        │
 ├──────────────────────────────────────┤
-│ core payload (same as .tv)            │
+│ core payload                          │
+│   same 9-byte core header, packed     │
+│   codes, scales, and TQ+ trailer      │
 ├──────────────────────────────────────┤
 │ slot_to_id  (n_vectors × u64 LE)      │
 └──────────────────────────────────────┘
@@ -165,4 +178,4 @@ On load, the reverse `id → slot` map is rebuilt in memory. Duplicate ids in th
 
 `dim = 0` in the header signals a lazy uncommitted index (the constructor asserts `dim ≥ 8` so this value is unambiguous). `dim = 0` is only valid alongside `n_vectors = 0`; on load it produces an index whose `dim` is `None` until the first `add` / `add_with_ids` call.
 
-Both formats are stable across minor versions. Breaking changes bump the file-format version byte (`.tvim`) or the header length (`.tv`).
+Both formats use a magic prefix plus a file-format version byte. Version 2 files load with identity TQ+ calibration; version 1 files are rejected with a rebuild hint because the per-vector scalar semantics changed.
